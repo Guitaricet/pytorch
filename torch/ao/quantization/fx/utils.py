@@ -25,8 +25,10 @@ from torch.ao.quantization.qconfig import (
 )
 from torch.ao.quantization.stubs import DeQuantStub
 from torch.ao.quantization.utils import (
-    activation_is_statically_quantized,
-    is_per_tensor,
+    _activation_is_statically_quantized,
+    _is_per_tensor,
+    _is_per_channel,
+    _to_underlying_dtype,
 )
 from torch.ao.quantization.observer import _is_activation_post_process
 
@@ -163,7 +165,7 @@ def graph_pretty_str(g, shorten=True) -> str:
     return res_str
 
 def get_per_tensor_qparams(activation_post_process):
-    assert is_per_tensor(activation_post_process.qscheme), 'Only per tensor quantization is supported'
+    assert _is_per_tensor(activation_post_process.qscheme), 'Only per tensor quantization is supported'
     scale, zero_point = activation_post_process.calculate_qparams()
     scale = float(scale)
     zero_point = int(zero_point)
@@ -580,7 +582,7 @@ def _is_custom_module_lstm(
     if qconfig is not None and qhandler is not None:
         assert isinstance(qhandler, torch.ao.quantization.fx.quantize_handler.QuantizeHandler)  # type: ignore[attr-defined]
         return isinstance(mod, torch.nn.LSTM) and \
-            activation_is_statically_quantized(qconfig) and \
+            _activation_is_statically_quantized(qconfig) and \
             qhandler.is_custom_module()
     else:
         return isinstance(mod, torch.ao.nn.quantizable.LSTM)
