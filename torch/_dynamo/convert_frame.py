@@ -9,6 +9,7 @@ from traceback import FrameSummary
 from typing import cast, Dict, List, Optional
 
 import torch
+from torch.fx.experimental.guard_env import GuardEnv, guarding
 from torch.fx.graph_module import _forward_from_src as original_forward_from_src
 
 from . import config, exc
@@ -267,8 +268,6 @@ def exception_handler(e, code, frame=None):
 
 def convert_frame_assert(
     compiler_fn: CompilerFn,
-    guard_export_fn=None,
-    guard_fail_fn=None,
     one_graph: bool = True,
     export: bool = False,
 ):
@@ -367,110 +366,113 @@ def _compile(
 ) -> Optional[GuardedCode]:
     output: Optional[OutputGraph] = None
 
-    # from .utils import print_once;  print_once(code.co_filename)
-    def transform(instructions, code_options):
-        nonlocal output
-        tracer = InstructionTranslator(
-            instructions,
-            code,
-            locals,
-            globals,
-            builtins,
-            code_options,
-            compiler_fn,
-            one_graph,
-            export,
-        )
-        tracer.run()
-        output = tracer.output
-        assert output is not None
-        assert output.output_instructions
-        instructions[:] = output.output_instructions
-        code_options.update(output.code_options)
+    guard_env = GuardEnv()
+    with guarding(guard_env):
+        # from .utils import print_once;  print_once(code.co_filename)
+        def transform(instructions, code_options):
+            nonlocal output
+            tracer = InstructionTranslator(
+                instructions,
+                code,
+                locals,
+                globals,
+                builtins,
+                code_options,
+                compiler_fn,
+                one_graph,
+                export,
+            )
+            tracer.run()
+            output = tracer.output
+            assert output is not None
+            assert output.output_instructions
+            instructions[:] = output.output_instructions
+            code_options.update(output.code_options)
 
-        if config.dead_code_elimination:
-            instructions[:] = remove_pointless_jumps(remove_dead_code(instructions))
+            if config.dead_code_elimination:
+                instructions[:] = remove_pointless_jumps(remove_dead_code(instructions))
 
-    try:
-        for attempt in itertools.count():
-            try:
-                out_code = transform_code_object(code, transform)
-                orig_code_map[out_code] = code
-                break
-            except exc.RestartAnalysis:
-                log.debug("Restarting analysis ...")
-                if attempt > 100:
-                    unimplemented("100+ RestartAnalysis() calls")
-            except exc.SkipFrame:
-                log.debug(
-                    f"Skipping frame {code.co_name} \
-                    {code.co_filename} {code.co_firstlineno}"
+        try:
+            for attempt in itertools.count():
+                try:
+                    out_code = transform_code_object(code, transform)
+                    orig_code_map[out_code] = code
+                    break
+                except exc.RestartAnalysis:
+                    log.debug("Restarting analysis ...")
+                    if attempt > 100:
+                        unimplemented("100+ RestartAnalysis() calls")
+                except exc.SkipFrame:
+                    log.debug(
+                        f"Skipping frame {code.co_name} \
+                        {code.co_filename} {code.co_firstlineno}"
+                    )
+                    if one_graph:
+                        log.debug("No graph captured with one_graph=True")
+                    return None
+            output_codes.add(out_code)
+
+            if config.output_code:
+                log.info(
+                    format_bytecode(
+                        "ORIGINAL BYTECODE",
+                        code.co_name,
+                        code.co_filename,
+                        code.co_firstlineno,
+                        code,
+                    ),
                 )
-                if one_graph:
-                    log.debug("No graph captured with one_graph=True")
-                return None
-        output_codes.add(out_code)
+                log.info(
+                    format_bytecode(
+                        "MODIFIED BYTECODE",
+                        code.co_name,
+                        code.co_filename,
+                        code.co_firstlineno,
+                        out_code,
+                    ),
+                )
 
-        if config.output_code:
-            log.info(
-                format_bytecode(
-                    "ORIGINAL BYTECODE",
-                    code.co_name,
-                    code.co_filename,
-                    code.co_firstlineno,
-                    code,
-                ),
-            )
-            log.info(
-                format_bytecode(
-                    "MODIFIED BYTECODE",
-                    code.co_name,
-                    code.co_filename,
-                    code.co_firstlineno,
-                    out_code,
-                ),
+            assert output is not None
+            assert output.guards is not None
+            CleanupManager.instance[out_code] = output.cleanups
+            check_fn = CheckFunctionManager(
+                output,
+                output.guards,
+                locals,
+                globals,
+                hooks.guard_fail_fn if hooks else None,
             )
 
-        assert output is not None
-        assert output.guards is not None
-        CleanupManager.instance[out_code] = output.cleanups
-        check_fn = CheckFunctionManager(
-            output,
-            output.guards,
-            locals,
-            globals,
-            hooks.guard_fail_fn if hooks else None,
-        )
+            guarded_code = GuardedCode(out_code, check_fn.check_fn)
 
-        guarded_code = GuardedCode(out_code, check_fn.check_fn)
+            if config.output_code:
+                guard_str = "GUARDS:\n"
+                guard_str += "\n".join(
+                    [f" - {str(guard)}" for guard in sorted(output.guards)]
+                )
+                log.info(guard_str)
 
-        if config.output_code:
-            guard_str = "GUARDS:\n"
-            guard_str += "\n".join(
-                [f" - {str(guard)}" for guard in sorted(output.guards)]
-            )
-            log.info(guard_str)
+            if hooks.guard_export_fn is not None:
+                hooks.guard_export_fn(output.guards)
 
-        if hooks.guard_export_fn is not None:
-            hooks.guard_export_fn(output.guards)
-
-        return guarded_code
-    except (
-        Unsupported,
-        TorchRuntimeError,
-        BackendCompilerFailed,
-        AssertionError,
-    ) as e:
-        exception_handler(e, code, frame)
-        raise
-    except Exception as e:
-        exception_handler(e, code, frame)
-        raise InternalTorchDynamoError() from e
+            return guarded_code
+        except (
+            Unsupported,
+            TorchRuntimeError,
+            BackendCompilerFailed,
+            AssertionError,
+        ) as e:
+            exception_handler(e, code, frame)
+            raise
+        except Exception as e:
+            exception_handler(e, code, frame)
+            raise InternalTorchDynamoError() from e
 
 
 def convert_frame(compiler_fn: CompilerFn, hooks: Hooks):
     """Try to convert a frame into an FX graph, if error leave frame unmodified"""
     inner_convert = convert_frame_assert(compiler_fn, one_graph=False)
+
     def _convert_frame(frame: types.FrameType, cache_size: int, hooks: Hooks):
         counters["frames"]["total"] += 1
         try:
